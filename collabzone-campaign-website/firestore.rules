@@ -1,0 +1,639 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+
+    function isBrandOwner(campaignId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/campaigns/$(campaignId)).data.ownerUid == request.auth.uid;
+    }
+
+    function isActiveCampaignProgram(programId) {
+      return programId == 'umkm'
+        || (
+          programId is string
+          && exists(/databases/$(database)/documents/campaignPrograms/$(programId))
+          && get(/databases/$(database)/documents/campaignPrograms/$(programId)).data.active == true
+        );
+    }
+
+    function isNewApplicationForUser(campaignId) {
+      let applicationId = campaignId + '_' + request.auth.uid;
+      return signedIn()
+        && !exists(/databases/$(database)/documents/applications/$(applicationId))
+        && existsAfter(/databases/$(database)/documents/applications/$(applicationId))
+        && getAfter(/databases/$(database)/documents/applications/$(applicationId)).data.campaignId == campaignId
+        && getAfter(/databases/$(database)/documents/applications/$(applicationId)).data.applicantUid == request.auth.uid;
+    }
+
+    function validKolProfileUpdate() {
+      return request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.get('instagram', '') is string
+        && request.resource.data.get('tiktok', '') is string
+        && request.resource.data.get('whatsapp', '') is string
+        && request.resource.data.get('photoData', '') is string
+        && request.resource.data.get('photoData', '').size() <= 200000;
+    }
+
+    function validKolVerificationAggregate(data) {
+      let instagramStatus = data.get('instagramVerificationStatus', 'not_requested');
+      let tiktokStatus = data.get('tiktokVerificationStatus', 'not_requested');
+      return (
+        (instagramStatus == 'approved' || tiktokStatus == 'approved')
+        && data.get('verificationStatus', 'not_requested') == 'approved'
+      ) || (
+        instagramStatus != 'approved'
+        && tiktokStatus != 'approved'
+        && (instagramStatus == 'pending' || tiktokStatus == 'pending')
+        && data.get('verificationStatus', 'not_requested') == 'pending'
+      ) || (
+        instagramStatus in ['not_requested', 'rejected']
+        && tiktokStatus in ['not_requested', 'rejected']
+        && (instagramStatus == 'rejected' || tiktokStatus == 'rejected')
+        && data.get('verificationStatus', 'not_requested') == 'rejected'
+      ) || (
+        instagramStatus == 'not_requested'
+        && tiktokStatus == 'not_requested'
+        && data.get('verificationStatus', 'not_requested') == 'not_requested'
+      );
+    }
+
+    function hasApprovedKolSocial(data) {
+      return data.get('instagramVerificationStatus', 'not_requested') == 'approved'
+        || data.get('tiktokVerificationStatus', 'not_requested') == 'approved'
+        || (
+          !data.keys().hasAny(['instagramVerificationStatus', 'tiktokVerificationStatus'])
+          && data.get('verificationStatus', 'not_requested') == 'approved'
+          && (
+            data.get('instagram', '') is string && data.get('instagram', '').size() > 0
+            || data.get('tiktok', '') is string && data.get('tiktok', '').size() > 0
+          )
+        );
+    }
+
+    function isKolFullyVerified(data) {
+      return data.get('verificationStatus', 'not_requested') == 'approved'
+        && hasApprovedKolSocial(data)
+        && data.get('name', '') is string
+        && data.get('name', '').size() > 0
+        && data.get('photoData', '') is string
+        && data.get('photoData', '').size() > 0
+        && (
+          data.get('instagram', '') is string && data.get('instagram', '').size() > 0
+          || data.get('tiktok', '') is string && data.get('tiktok', '').size() > 0
+        )
+        && data.get('regularApplicationCompleted', false) == true;
+    }
+
+    function allowedKolSocialStatus(platform, field) {
+      let statusField = platform + 'VerificationStatus';
+      let oldStatus = resource.data.get(statusField, 'not_requested');
+      let newStatus = request.resource.data.get(statusField, 'not_requested');
+      let oldLink = resource.data.get(field, '');
+      let newLink = request.resource.data.get(field, '');
+      return newStatus == oldStatus
+        || (
+          !resource.data.keys().hasAny([statusField])
+          && resource.data.get('verificationStatus', 'not_requested') in ['approved', 'pending', 'rejected']
+          && oldLink is string
+          && oldLink.size() > 0
+          && newStatus == resource.data.verificationStatus
+        )
+        || (newLink != oldLink && newStatus == 'not_requested');
+    }
+
+    function pendingKolSocialLinksUnchanged() {
+      let legacyPending = !resource.data.keys().hasAny([
+        'instagramVerificationStatus', 'tiktokVerificationStatus'
+      ]) && resource.data.get('verificationStatus', 'not_requested') == 'pending';
+      return (
+        (legacyPending || resource.data.get('instagramVerificationStatus', 'not_requested') != 'pending'
+          || request.resource.data.get('instagram', '') == resource.data.get('instagram', ''))
+        && (legacyPending || resource.data.get('tiktokVerificationStatus', 'not_requested') != 'pending'
+          || request.resource.data.get('tiktok', '') == resource.data.get('tiktok', ''))
+      );
+    }
+
+    function validSocialVerificationReview(platform) {
+      let statusField = platform + 'VerificationStatus';
+      let oldFieldStatus = resource.data.get(statusField, 'not_requested');
+      let newFieldStatus = request.resource.data.get(statusField, 'not_requested');
+      let isLegacyPending = !resource.data.keys().hasAny(['instagramVerificationStatus', 'tiktokVerificationStatus'])
+        && resource.data.get('verificationStatus', 'not_requested') == 'pending'
+        && resource.data.get(platform, '') is string
+        && resource.data.get(platform, '').size() > 0;
+      return resource.data.role == 'kol'
+        && (oldFieldStatus == 'pending' || isLegacyPending)
+        && newFieldStatus in ['approved', 'rejected']
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          statusField, platform + 'VerificationReviewedAt', 'verificationStatus', 'verificationReviewedAt'
+        ])
+        && request.resource.data.get(platform + 'VerificationReviewedAt', 0) is number
+        && request.resource.data.verificationReviewedAt is number
+        && validKolVerificationAggregate(request.resource.data)
+        && (
+          newFieldStatus != 'approved'
+          || (
+            resource.data.get('name', '') is string
+            && resource.data.get('name', '').size() > 0
+            && resource.data.get(platform, '') is string
+            && resource.data.get(platform, '').size() > 0
+          )
+        );
+    }
+
+    function socialLinksChanged() {
+      return request.resource.data.get('instagram', '') != resource.data.get('instagram', '')
+        || request.resource.data.get('tiktok', '') != resource.data.get('tiktok', '');
+    }
+
+    function isNewRegularApplication(uid, campaignId) {
+      let applicationId = campaignId + '_' + uid;
+      return campaignId is string
+        && campaignId.size() > 0
+        && existsAfter(/databases/$(database)/documents/applications/$(applicationId))
+        && getAfter(/databases/$(database)/documents/applications/$(applicationId)).data.applicantUid == uid
+        && getAfter(/databases/$(database)/documents/applications/$(applicationId)).data.campaignId == campaignId
+        && exists(/databases/$(database)/documents/campaigns/$(campaignId))
+        && get(/databases/$(database)/documents/campaigns/$(campaignId)).data.type == 'regular';
+    }
+
+    match /users/{uid} {
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.keys().hasOnly([
+          'uid', 'role', 'name', 'email', 'balance', 'createdAt', 'verificationStatus',
+          'instagramVerificationStatus', 'tiktokVerificationStatus'
+        ])
+        && request.resource.data.role in ['kol', 'brand']
+        && request.resource.data.balance == 0
+        && (request.resource.data.role != 'kol' || (
+          request.resource.data.verificationStatus == 'not_requested'
+          && request.resource.data.get('instagramVerificationStatus', 'not_requested') == 'not_requested'
+          && request.resource.data.get('tiktokVerificationStatus', 'not_requested') == 'not_requested'
+        ))
+        && request.resource.data.email == request.auth.token.email;
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+      allow update: if signedIn() && (
+        (
+          request.auth.uid == uid
+          && (
+            (
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name'])
+              && request.resource.data.name is string
+              && request.resource.data.name.size() > 0
+              && request.resource.data.name.size() <= 100
+            )
+            || (
+              resource.data.role == 'brand'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balance', 'lastCampaignChargeId'])
+              && request.resource.data.balance is number
+              && request.resource.data.balance == resource.data.balance - 100000
+              && request.resource.data.balance >= 0
+              && request.resource.data.lastCampaignChargeId is string
+              && existsAfter(/databases/$(database)/documents/campaigns/$(request.resource.data.lastCampaignChargeId))
+              && getAfter(/databases/$(database)/documents/campaigns/$(request.resource.data.lastCampaignChargeId)).data.ownerUid == uid
+            )
+            || (
+              resource.data.role == 'kol'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'name', 'instagram', 'tiktok', 'whatsapp', 'photoData',
+                'verificationStatus', 'instagramVerificationStatus', 'tiktokVerificationStatus'
+              ])
+              && validKolProfileUpdate()
+              && pendingKolSocialLinksUnchanged()
+              && allowedKolSocialStatus('instagram', 'instagram')
+              && allowedKolSocialStatus('tiktok', 'tiktok')
+              && validKolVerificationAggregate(request.resource.data)
+            )
+            || (
+              resource.data.role == 'brand'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['instagram', 'tiktok', 'whatsapp'])
+              && request.resource.data.instagram is string
+              && request.resource.data.tiktok is string
+              && request.resource.data.whatsapp is string
+            )
+            || (
+              resource.data.role == 'kol'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'verificationStatus', 'verificationRequestedAt',
+                'instagramVerificationStatus', 'instagramVerificationRequestedAt'
+              ])
+              && resource.data.get('instagramVerificationStatus', 'not_requested') in ['not_requested', 'rejected']
+              && request.resource.data.instagramVerificationStatus == 'pending'
+              && request.resource.data.instagramVerificationRequestedAt is number
+              && request.resource.data.verificationRequestedAt is number
+              && request.resource.data.verificationStatus in ['pending', 'approved']
+              && validKolProfileUpdate()
+              && request.resource.data.get('instagram', '') is string
+              && request.resource.data.get('instagram', '').size() > 0
+              && validKolVerificationAggregate(request.resource.data)
+            )
+            || (
+              resource.data.role == 'kol'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'verificationStatus', 'verificationRequestedAt',
+                'tiktokVerificationStatus', 'tiktokVerificationRequestedAt'
+              ])
+              && resource.data.get('tiktokVerificationStatus', 'not_requested') in ['not_requested', 'rejected']
+              && request.resource.data.tiktokVerificationStatus == 'pending'
+              && request.resource.data.tiktokVerificationRequestedAt is number
+              && request.resource.data.verificationRequestedAt is number
+              && request.resource.data.verificationStatus in ['pending', 'approved']
+              && validKolProfileUpdate()
+              && request.resource.data.get('tiktok', '') is string
+              && request.resource.data.get('tiktok', '').size() > 0
+              && validKolVerificationAggregate(request.resource.data)
+            )
+            || (
+              resource.data.role == 'kol'
+              && resource.data.get('regularApplicationCompleted', false) != true
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'regularApplicationCompleted', 'regularApplicationCampaignId'
+              ])
+              && request.resource.data.regularApplicationCompleted == true
+              && request.resource.data.regularApplicationCampaignId is string
+              && isNewRegularApplication(uid, request.resource.data.regularApplicationCampaignId)
+            )
+          )
+        )
+        || (
+          isAdmin()
+          && resource.data.role == 'brand'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balance', 'lastApprovedTopupId'])
+          && request.resource.data.balance == resource.data.balance + 100000
+          && request.resource.data.lastApprovedTopupId is string
+          && existsAfter(/databases/$(database)/documents/topupRequests/$(request.resource.data.lastApprovedTopupId))
+          && getAfter(/databases/$(database)/documents/topupRequests/$(request.resource.data.lastApprovedTopupId)).data.ownerUid == uid
+          && getAfter(/databases/$(database)/documents/topupRequests/$(request.resource.data.lastApprovedTopupId)).data.status == 'approved'
+          && getAfter(/databases/$(database)/documents/topupRequests/$(request.resource.data.lastApprovedTopupId)).data.amount == 100000
+        )
+        || (
+          isAdmin()
+          && resource.data.role == 'kol'
+          && (validSocialVerificationReview('instagram') || validSocialVerificationReview('tiktok'))
+        )
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /campaigns/{campaignId} {
+      allow read: if true;
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+          'id', 'brandName', 'ownerUid', 'type', 'title', 'description',
+          'terms', 'fee', 'cpm', 'videoCount', 'reward', 'banner', 'slots',
+          'applicantsCount', 'createdAt', 'specialProgram'
+        ])
+        && request.resource.data.type in ['regular', 'special']
+        && request.resource.data.slots == 5
+        && request.resource.data.applicantsCount == 0
+        && (
+          (request.resource.data.type == 'special'
+            && isActiveCampaignProgram(request.resource.data.specialProgram)
+            && request.resource.data.cpm is number
+            && request.resource.data.cpm > 0)
+          || (request.resource.data.type == 'regular' && request.resource.data.specialProgram == '')
+        )
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'brand'
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.balance >= 100000
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.balance
+          == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.balance - 100000
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.lastCampaignChargeId == campaignId;
+      allow update: if isAdmin() || (
+        signedIn()
+        && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'brandName', 'type', 'title', 'description', 'terms',
+          'fee', 'cpm', 'videoCount', 'reward', 'banner', 'slots', 'createdAt', 'specialProgram'
+        ])
+        && (
+          (request.resource.data.type == 'special'
+            && (
+              isActiveCampaignProgram(request.resource.data.specialProgram)
+              || request.resource.data.specialProgram == resource.data.get('specialProgram', 'available')
+            )
+            && request.resource.data.cpm is number
+            && request.resource.data.cpm > 0)
+          || (request.resource.data.type == 'regular' && request.resource.data.specialProgram == '')
+        )
+      ) || (
+        signedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['applicantsCount'])
+        && request.resource.data.applicantsCount == resource.data.applicantsCount + 1
+        && isNewApplicationForUser(campaignId)
+      );
+      allow delete: if isAdmin() || (signedIn() && resource.data.ownerUid == request.auth.uid);
+    }
+
+    match /topupRequests/{requestId} {
+      allow get, list: if isAdmin() || (signedIn() && resource.data.ownerUid == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'brand'
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.brandName == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.name
+        && request.resource.data.keys().hasAll([
+          'id', 'ownerUid', 'brandName', 'email', 'amount', 'method',
+          'displayId', 'createdAt', 'status'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'id', 'ownerUid', 'brandName', 'email', 'amount', 'method',
+          'displayId', 'createdAt', 'status'
+        ])
+        && request.resource.data.id == requestId
+        && request.resource.data.amount == 100000
+        && request.resource.data.method == 'Transfer bank'
+        && request.resource.data.displayId == requestId + '-' + request.resource.data.brandName
+        && request.resource.data.createdAt is number
+        && request.resource.data.status == 'pending';
+      allow update: if isAdmin()
+        && resource.data.status == 'pending'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'reviewedAt', 'reviewedBy'])
+        && request.resource.data.status in ['approved', 'rejected']
+        && request.resource.data.reviewedAt is number
+        && request.resource.data.reviewedBy == request.auth.uid
+        && (
+          request.resource.data.status == 'rejected'
+          || (
+            request.resource.data.status == 'approved'
+            && getAfter(/databases/$(database)/documents/users/$(resource.data.ownerUid)).data.balance
+              == get(/databases/$(database)/documents/users/$(resource.data.ownerUid)).data.balance + 100000
+            && getAfter(/databases/$(database)/documents/users/$(resource.data.ownerUid)).data.lastApprovedTopupId == requestId
+          )
+        );
+      allow delete: if isAdmin();
+
+      match /private/{receiptId} {
+        allow get: if isAdmin()
+          || (
+            signedIn()
+            && get(/databases/$(database)/documents/topupRequests/$(requestId)).data.ownerUid == request.auth.uid
+          );
+        allow list: if false;
+        allow create: if signedIn()
+          && receiptId == 'receipt'
+          && getAfter(/databases/$(database)/documents/topupRequests/$(requestId)).data.ownerUid == request.auth.uid
+          && getAfter(/databases/$(database)/documents/topupRequests/$(requestId)).data.status == 'pending'
+          && request.resource.data.keys().hasOnly(['receiptData'])
+          && request.resource.data.receiptData is string
+          && request.resource.data.receiptData.size() <= 480000
+          && request.resource.data.receiptData.matches('^data:image/jpeg;base64,[A-Za-z0-9+/=]+$');
+        allow update, delete: if isAdmin();
+      }
+    }
+
+    match /applications/{applicationId} {
+      allow get: if isAdmin()
+        || (signedIn() && resource.data.applicantUid == request.auth.uid)
+        || (signedIn() && resource.data.ownerUid == request.auth.uid)
+        || (signedIn() && applicationId.matches('.*_' + request.auth.uid));
+      allow list: if isAdmin()
+        || (signedIn() && resource.data.applicantUid == request.auth.uid)
+        || (signedIn() && resource.data.ownerUid == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.applicantUid == request.auth.uid
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'kol'
+        && exists(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId))
+        && (
+          get(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId)).data.type == 'regular'
+          || (
+            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('verificationStatus', 'not_requested') == 'approved'
+            && hasApprovedKolSocial(get(/databases/$(database)/documents/users/$(request.auth.uid)).data)
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('name', '') is string
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('name', '').size() > 0
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('photoData', '') is string
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('photoData', '').size() > 0
+            && (
+              (
+                get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('instagram', '') is string
+                && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('instagram', '').size() > 0
+              )
+              || (
+                get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('tiktok', '') is string
+                && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('tiktok', '').size() > 0
+              )
+            )
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('regularApplicationCompleted', false) == true
+          )
+        )
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.keys().hasOnly([
+          'id', 'campaignId', 'campaignTitle', 'brandName', 'ownerUid',
+          'applicantUid', 'name', 'email', 'social', 'instagram', 'tiktok',
+          'fee', 'status', 'createdAt', 'applicantVerified'
+        ])
+        && request.resource.data.instagram is string
+        && request.resource.data.tiktok is string
+        && request.resource.data.fee >= 0
+        && request.resource.data.status == 'Menunggu'
+        && request.resource.data.applicantVerified == isKolFullyVerified(getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data)
+        && request.resource.data.name == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('name', '')
+        && request.resource.data.instagram == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('instagram', '')
+        && request.resource.data.tiktok == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('tiktok', '')
+        && exists(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId))
+        && get(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId)).data.ownerUid
+          == request.resource.data.ownerUid
+        && get(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId)).data.title
+          == request.resource.data.campaignTitle
+        && get(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId)).data.brandName
+          == request.resource.data.brandName
+        && (
+          get(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId)).data.type == 'regular'
+          || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('regularApplicationCompleted', false) == true
+        )
+        && getAfter(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId)).data.applicantsCount
+          == get(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId)).data.applicantsCount + 1
+        && getAfter(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId)).data.applicantsCount
+          <= get(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId)).data.slots;
+      allow update: if isAdmin() || (
+        isBrandOwner(resource.data.campaignId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && (
+          (
+            resource.data.get('status', 'Menunggu') == 'Menunggu'
+            && request.resource.data.status in ['Diterima', 'Ditolak']
+          )
+          || (
+            resource.data.status == 'Diterima'
+            && request.resource.data.status == 'Product Shipping'
+          )
+          || (
+            resource.data.status == 'Product Shipping'
+            && request.resource.data.status == 'Draft Video'
+          )
+          || (
+            resource.data.status == 'Draft Video'
+            && request.resource.data.status == 'Payment'
+          )
+        )
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /conversations/{conversationId} {
+      allow read: if signedIn()
+        && (resource.data.brandUid == request.auth.uid || resource.data.kolUid == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'applicationId', 'campaignId', 'campaignTitle', 'brandUid', 'brandName',
+          'kolUid', 'kolName', 'createdAt', 'updatedAt', 'lastMessage',
+          'lastMessageAt', 'unreadForBrand', 'unreadForKol'
+        ])
+        && request.resource.data.applicationId == conversationId
+        && request.resource.data.brandUid == request.auth.uid
+        && request.resource.data.unreadForBrand == 0
+        && request.resource.data.unreadForKol == 0
+        && exists(/databases/$(database)/documents/applications/$(conversationId))
+        && get(/databases/$(database)/documents/applications/$(conversationId)).data.ownerUid == request.auth.uid
+        && get(/databases/$(database)/documents/applications/$(conversationId)).data.applicantUid == request.resource.data.kolUid
+        && get(/databases/$(database)/documents/applications/$(conversationId)).data.status == 'Diterima';
+      allow update: if signedIn()
+        && (resource.data.brandUid == request.auth.uid || resource.data.kolUid == request.auth.uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'lastMessage', 'lastMessageAt', 'updatedAt', 'unreadForBrand', 'unreadForKol'
+        ])
+        && request.resource.data.lastMessage is string
+        && request.resource.data.lastMessage.size() <= 1000;
+      allow delete: if isAdmin();
+
+      match /messages/{messageId} {
+        allow read: if signedIn()
+          && (get(/databases/$(database)/documents/conversations/$(conversationId)).data.brandUid == request.auth.uid
+            || get(/databases/$(database)/documents/conversations/$(conversationId)).data.kolUid == request.auth.uid);
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly(['senderUid', 'senderName', 'text', 'createdAt'])
+          && request.resource.data.senderUid == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 1000
+          && exists(/databases/$(database)/documents/conversations/$(conversationId))
+          && (
+            get(/databases/$(database)/documents/conversations/$(conversationId)).data.brandUid == request.auth.uid
+            || get(/databases/$(database)/documents/conversations/$(conversationId)).data.kolUid == request.auth.uid
+          )
+          && get(/databases/$(database)/documents/applications/$(conversationId)).data.status == 'Diterima';
+        allow update, delete: if false;
+      }
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.recipientUid == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.senderUid == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+          'id', 'to', 'recipientUid', 'senderUid', 'applicationId',
+          'campaignId', 'topupRequestId', 'platform', 'event', 'message', 'createdAt', 'read'
+        ])
+        && request.resource.data.read == false
+        && (
+          (
+            request.resource.data.event == 'application_submitted'
+            && exists(/databases/$(database)/documents/applications/$(request.resource.data.applicationId))
+            && get(/databases/$(database)/documents/applications/$(request.resource.data.applicationId)).data.applicantUid == request.auth.uid
+            && get(/databases/$(database)/documents/applications/$(request.resource.data.applicationId)).data.ownerUid == request.resource.data.recipientUid
+          )
+          || (
+            request.resource.data.event == 'application_reviewed'
+            && exists(/databases/$(database)/documents/applications/$(request.resource.data.applicationId))
+            && get(/databases/$(database)/documents/applications/$(request.resource.data.applicationId)).data.ownerUid == request.auth.uid
+            && get(/databases/$(database)/documents/applications/$(request.resource.data.applicationId)).data.applicantUid == request.resource.data.recipientUid
+          )
+          || (
+            request.resource.data.event == 'campaign_created'
+            && request.resource.data.campaignId is string
+            && exists(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId))
+            && get(/databases/$(database)/documents/campaigns/$(request.resource.data.campaignId)).data.ownerUid == request.auth.uid
+            && request.resource.data.recipientUid == request.auth.uid
+          )
+          || (
+            request.resource.data.event == 'verification_requested'
+            && request.resource.data.recipientUid == 'admin'
+            && request.resource.data.senderUid == request.auth.uid
+            && request.resource.data.platform in ['instagram', 'tiktok']
+            && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'kol'
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get(request.resource.data.platform + 'VerificationStatus', 'not_requested') in ['not_requested', 'rejected']
+            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.get(request.resource.data.platform + 'VerificationStatus', '') == 'pending'
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get(request.resource.data.platform, '') is string
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get(request.resource.data.platform, '').size() > 0
+            && request.resource.data.message is string
+            && request.resource.data.message.size() <= 240
+          )
+          || (
+            request.resource.data.event == 'topup_submitted'
+            && request.resource.data.recipientUid == 'admin'
+            && existsAfter(/databases/$(database)/documents/topupRequests/$(request.resource.data.topupRequestId))
+            && getAfter(/databases/$(database)/documents/topupRequests/$(request.resource.data.topupRequestId)).data.ownerUid == request.auth.uid
+            && getAfter(/databases/$(database)/documents/topupRequests/$(request.resource.data.topupRequestId)).data.status == 'pending'
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'brand'
+            && request.resource.data.message is string
+            && request.resource.data.message.size() <= 240
+          )
+          || (
+            isAdmin()
+            && request.resource.data.event == 'topup_reviewed'
+            && request.resource.data.recipientUid is string
+            && existsAfter(/databases/$(database)/documents/topupRequests/$(request.resource.data.topupRequestId))
+            && getAfter(/databases/$(database)/documents/topupRequests/$(request.resource.data.topupRequestId)).data.ownerUid == request.resource.data.recipientUid
+            && getAfter(/databases/$(database)/documents/topupRequests/$(request.resource.data.topupRequestId)).data.status in ['approved', 'rejected']
+            && request.resource.data.senderUid == request.auth.uid
+            && request.resource.data.message is string
+            && request.resource.data.message.size() <= 240
+          )
+          || (
+            isAdmin()
+            && request.resource.data.event == 'verification_reviewed'
+            && request.resource.data.recipientUid is string
+            && exists(/databases/$(database)/documents/users/$(request.resource.data.recipientUid))
+            && get(/databases/$(database)/documents/users/$(request.resource.data.recipientUid)).data.role == 'kol'
+            && request.resource.data.platform in ['instagram', 'tiktok']
+            && (
+              get(/databases/$(database)/documents/users/$(request.resource.data.recipientUid)).data.get(request.resource.data.platform + 'VerificationStatus', 'not_requested') == 'pending'
+              || (
+                !get(/databases/$(database)/documents/users/$(request.resource.data.recipientUid)).data.keys().hasAny([
+                  'instagramVerificationStatus', 'tiktokVerificationStatus'
+                ])
+                && get(/databases/$(database)/documents/users/$(request.resource.data.recipientUid)).data.get('verificationStatus', 'not_requested') == 'pending'
+              )
+            )
+            && getAfter(/databases/$(database)/documents/users/$(request.resource.data.recipientUid)).data.get(request.resource.data.platform + 'VerificationStatus', '') in ['approved', 'rejected']
+            && request.resource.data.senderUid == request.auth.uid
+            && request.resource.data.message is string
+            && request.resource.data.message.size() <= 240
+          )
+        );
+      allow update: if signedIn()
+        && (resource.data.recipientUid == request.auth.uid
+          || (isAdmin() && resource.data.event in ['verification_requested', 'topup_submitted'] && resource.data.recipientUid == 'admin'))
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow delete: if isAdmin();
+    }
+
+    match /campaignPrograms/{programId} {
+      allow read: if true;
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasAll(['name', 'description', 'createdAt', 'active'])
+        && request.resource.data.keys().hasOnly(['name', 'description', 'createdAt', 'active'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 240
+        && request.resource.data.createdAt is number
+        && request.resource.data.active == true;
+      allow update, delete: if false;
+    }
+  }
+}
